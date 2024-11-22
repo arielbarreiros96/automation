@@ -88,6 +88,7 @@ class AutomationConfiguration(models.Model):
         inverse_name="configuration_id",
         domain=[("parent_id", "=", False)],
     )
+    record_ids = fields.One2many('automation.record', 'configuration_id', string="Automation Records")
     record_test_count = fields.Integer(compute="_compute_record_test_count")
     record_count = fields.Integer(compute="_compute_record_count")
     record_done_count = fields.Integer(compute="_compute_record_count")
@@ -135,7 +136,7 @@ class AutomationConfiguration(models.Model):
             record.activity_mail_count = mapped_data[record.id].get("mail", 0)
             record.activity_action_count = mapped_data[record.id].get("action", 0)
 
-    @api.depends()
+    @api.depends('record_ids.state', 'record_ids.is_test', 'record_ids.is_placeholder')
     def _compute_record_count(self):
         data = self.env["automation.record"].read_group(
             [("configuration_id", "in", self.ids), ("is_test", "=", False)],
@@ -151,7 +152,7 @@ class AutomationConfiguration(models.Model):
             record.record_run_count = mapped_data[record.id].get("periodic", 0)
             record.record_count = sum(mapped_data[record.id].values())
 
-    @api.depends()
+    @api.depends('record_ids.state', 'record_ids.is_test', 'record_ids.is_placeholder')
     def _compute_record_test_count(self):
         data = self.env["automation.record"].read_group(
             [("configuration_id", "in", self.ids), ("is_test", "=", True)],

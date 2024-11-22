@@ -4,7 +4,8 @@
 import logging
 from collections import defaultdict
 
-from odoo import api, fields, models
+from odoo import _, api, fields, models
+from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
 
@@ -15,8 +16,16 @@ class AutomationRecord(models.Model):
     _description = "Automation Record"
 
     name = fields.Char(compute="_compute_name")
+    is_orphaned = fields.Boolean(
+        compute="_compute_is_orphaned",
+        store=False,
+    )
+    is_placeholder = fields.Boolean(default=False)
+    orphaned_id = fields.Integer()
     state = fields.Selection(
-        [("run", "Running"), ("done", "Done")], compute="_compute_state", store=True
+        [("run", "Running"), ("done", "Done"), ("orphaned", "Orphaned")],
+        compute="_compute_state",
+        store=True,
     )
     configuration_id = fields.Many2one(
         "automation.configuration", required=True, readonly=True
@@ -49,14 +58,16 @@ class AutomationRecord(models.Model):
             .search([("is_mail_thread", "=", True)])
         ]
 
-    @api.depends("automation_step_ids.state")
+    @api.depends("automation_step_ids.state", "is_orphaned")
     def _compute_state(self):
         for record in self:
-            record.state = (
-                "run"
-                if record.automation_step_ids.filtered(lambda r: r.state == "scheduled")
-                else "done"
-            )
+            if record.is_orphaned:
+                record.state = "orphaned"
+            else:
+                scheduled_steps = record.automation_step_ids.filtered(
+                    lambda r: r.state == "scheduled"
+                )
+                record.state = "run" if scheduled_steps else "done"
 
     @api.depends("model", "res_id")
     def _compute_resource_ref(self):
@@ -70,6 +81,13 @@ class AutomationRecord(models.Model):
     def _compute_name(self):
         for record in self:
             record.name = self.env[record.model].browse(record.res_id).display_name
+
+    @api.depends("res_id", "model")
+    def _compute_is_orphaned(self):
+        for record in self:
+            record.is_orphaned = not bool(
+                self.env[record.model].browse(record.res_id).exists()
+            )
 
     @api.model
     def _search(
@@ -89,70 +107,65 @@ class AutomationRecord(models.Model):
             count=False,
             access_rights_uid=access_rights_uid,
         )
-        if self.env.is_system():
-            # restrictions do not apply to group "Settings"
-            return len(ids) if count else ids
-
-        # TODO highlight orphaned records in UI:
-        #  - self.model + self.res_id are set
-        #  - self.record returns empty recordset
-        # Remark: self.record is @property, not field
-
         if not ids:
             return 0 if count else []
-        orig_ids = ids
-        ids = set(ids)
-        result = []
-        model_data = defaultdict(
-            lambda: defaultdict(set)
-        )  # {res_model: {res_id: set(ids)}}
-        for sub_ids in self._cr.split_for_in_conditions(ids):
-            self._cr.execute(
-                """
-                            SELECT id, res_id, model
-                            FROM "%s"
-                            WHERE id = ANY (%%(ids)s)"""
-                % self._table,
-                dict(ids=list(sub_ids)),
-            )
-            for eid, res_id, model in self._cr.fetchall():
-                model_data[model][res_id].add(eid)
 
-        for model, targets in model_data.items():
-            if not self.env[model].check_access_rights("read", False):
-                continue
-            recs = self.env[model].browse(list(targets))
-            missing = recs - recs.exists()
-            if missing:
-                for res_id in missing.ids:
-                    _logger.warning(
-                        "Deleted record %s,%s is referenced by automation.record %s",
-                        model,
-                        res_id,
-                        list(targets[res_id]),
-                    )
-                recs = recs - missing
-            allowed = (
-                self.env[model]
-                .with_context(active_test=False)
-                ._search([("id", "in", recs.ids)])
+        model_data = defaultdict(set)  # {res_model: set(res_id)}
+        for res_id, model in self.browse(ids).mapped(
+            lambda r: (r.id, r.res_id, r.model)
+        ):
+            model_data[model].add(res_id)
+
+        orphaned_ids = set()
+        for model, res_ids in model_data.items():
+            existing_ids = set(self.env[model].browse(list(res_ids)).exists().ids)
+            orphaned_ids |= set(res_ids) - existing_ids
+
+        existing_placeholders = self.browse(ids).filtered(
+            lambda r: r.is_placeholder and r.orphaned_id
+        )
+
+        # Construir el map de placeholders usando los registros ya disponibles
+        placeholders_map = {
+            placeholder.orphaned_id: placeholder.id
+            for placeholder in existing_placeholders
+        }
+
+        placeholder_ids = []
+        for record in self.browse(ids).filtered(
+            lambda r: r.res_id in orphaned_ids and not r.is_placeholder
+        ):
+            if record.id in placeholders_map:
+                # Existing placeholder found, add its ID
+                placeholder_ids.append(placeholders_map[record.id])
+            else:
+                # Create a new placeholder if not already linked
+                placeholder = self.create(
+                    {
+                        "name": _(f"[Orphaned Record - ID {record.id}]"),
+                        "orphaned_id": record.id,
+                        "is_orphaned": True,
+                        "is_test": False,
+                        "model": record.model,
+                        "res_id": None,
+                        "state": "orphaned",
+                        "configuration_id": record.configuration_id.id,
+                        "is_placeholder": True,
+                    }
+                )
+                placeholder_ids.append(placeholder.id)
+
+        valid_ids = [
+            rec_id
+            for rec_id, res_id, model in self.browse(ids).mapped(
+                lambda r: (r.id, r.res_id, r.model)
             )
-            for target_id in allowed:
-                result += list(targets[target_id])
-        if len(orig_ids) == limit and len(result) < len(orig_ids):
-            result.extend(
-                self._search(
-                    args,
-                    offset=offset + len(orig_ids),
-                    limit=limit,
-                    order=order,
-                    count=count,
-                    access_rights_uid=access_rights_uid,
-                )[: limit - len(result)]
-            )
-        # Restore original ordering
-        result = [x for x in orig_ids if x in result]
-        return len(result) if count else list(result)
+            if res_id not in orphaned_ids
+        ]
+
+        valid_ids.extend(placeholder_ids)
+
+        return len(valid_ids) if count else valid_ids
 
     def read(self, fields=None, load="_classic_read"):
         """Override to explicitely call check_access_rule, that is not called
@@ -188,4 +201,11 @@ class AutomationRecord(models.Model):
 
     def write(self, vals):
         self.check_access_rule("write")
+        if any(self.filtered("is_orphaned")):
+            raise UserError("You cannot modify orphaned records.")
         return super().write(vals)
+
+    def unlink(self):
+        if any(self.filtered("is_orphaned")):
+            raise UserError("You cannot delete orphaned records.")
+        return super().unlink()
