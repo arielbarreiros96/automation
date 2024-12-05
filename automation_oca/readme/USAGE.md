@@ -6,7 +6,7 @@ Configure your processes
 3. Set the model and domains.
 4. Go to Configuration -> Filters to create filters as a preconfigured domains.
   Filters can be established in the proper field in the Automation Configuration record.
-5. Create the different steps by clicking the "ADD" button inside the automation configuration form.
+5. Create the different steps by clicking the "ADD" button inside the automation configuration form.auysdutasdyutaisdyutiuytiuytiuyt iuytsdfi ayustdf iyustdf iuyt 
 6. Create child steps by clicking the "Add child activity" at the bottom of a created step.
 7.
 8. Select the kind of configuration you create. You can choose between:
